@@ -1,0 +1,63 @@
+从目前（截至2026年下半年）的前沿文献与产业实践来看，**将 Kimi 团队提出的 Attention Residuals (AttnRes) 直接应用或大规模迁移到 Vision Transformer (ViT) / Visual Foundation Models (VFM) 的研究尚处于概念验证与早期探索阶段，尚未出现类似于 K3 在 LLM 中那样占据主流地位的标杆性视觉大模型成果。**
+
+近期的扩展研究（如 2026 年 5 月出现的 *Delta Attention Residuals* 以及针对 AttnRes 离群值/注意力汇聚问题的分析论文 *AoS/OASIS* 等）绝大多数仍聚焦在文本 LLM 与 Multi-Modal LLM 的语言/序列解码器侧。
+
+---
+
+### 一、 为什么 ViT / VFM 尚未大规模采纳 AttnRes？（现有探索现状）
+
+在传统视觉 Transformer 领域，此前有一些包含“Attention Residual”命名或类似机制的研究（例如 CVPR 2024 的 *LaViT*、医疗图像中的 *ReViT*），但**它们与 Kimi 提出的 AttnRes 存在本质差异**：
+
+* 传统 ViT 的“残差注意力”多指**跨层复用 Attention Map**（跨层共享/累加注意力权重矩阵以节省算力）。
+* Kimi 的 **AttnRes** 则是**用 Learned Depth-wise Softmax Attention 替代主干网络（Backbone）沿着深度维度的传统加性残差加和（Additive Residual Accumulation）**，解决深度维度的 PreNorm 稀释与表征选择性检索问题。
+
+目前在视觉领域尚未出现统治级 AttnRes 应用的原因主要在于：
+
+1. **网络深度差异**：标准 ViT（如 ViT-B/16, ViT-L/14）通常只有 12 到 24 层，PreNorm 导致的信号幅值膨胀和深度稀释（Depth Dilution）效应不如 80~120 层的极深 LLM 那么严重。
+2. **Token 表征形态差异**：CV/VFM 的 Token 序列（如 Patch Tokens）具有极强的空间局部冗余性与平滑性，与 NLP 的离散语义 Token 存在归纳偏置差异。
+
+---
+
+### 二、 将 Attention Residuals 引入 ViT / VFM 的核心价值与意义
+
+将 AttnRes 迁移至 Visual Foundation Models（特别是深层 ViT、DINOv2、CLIP 视觉编码器、DiT/Diffusion Backbones）具有极高的学术探索价值与工业落地潜力：
+
+#### 1. 解决深层 ViT 的“表征退化”与低层高频细节丢失
+
+* **传统问题**：在深度 ViT 中，逐层加性残差（$h_L = h_0 + \sum f_i$）会导致底层的高频空间细节（如边缘、纹理、局部几何结构）在经过数十层 PreNorm 叠加后被“稀释”或淹平。深层网络几乎只能捕获全局语义，损失了密集预测任务（Segmentation, Pose, Depth Estimation）所需的细粒度信息。
+* **AttnRes 的增益**：AttnRes 允许第 $L$ 层通过 Learned Query，跨越中间层直接向底层 $h_0$ 或 $h_1$ 赋予较高的 Softmax 检索权重。这相当于为视觉模型建立了一个**动态的、按需提取的多尺度/多深度特征通道**，使深层在保持高层语义表达的同时，无需依靠繁琐的 Feature Pyramid Network (FPN) 即可直连低层细节。
+
+#### 2. 重塑 ViT 的“纵向-横向”架构设计原则（更深更窄的视觉模型）
+
+* 根据 Kimi 团队在 scaling law 上的发现，引入 AttnRes 后，模型的最佳配置倾向于“更深、更窄”（Deeper & Narrower）。
+* **对 VFM 的意义**：传统 ViT（如 ViT-Huge / ViT-Giant）为了提升容量，往往盲目增加 Width（Dim 达到 1280 或 1536），导致 Self-Attention 的 FLOPs 呈二次方飙升。如果 AttnRes 能打破 ViT 增加深度时的梯度/表征衰减瓶颈，我们就可以用**极深但通道较窄的 ViT**（例如 64 层但 Dim=512）达到甚至超越宽度模型的性能，从而大幅降低参数量与显存占用。
+
+#### 3. 增强多模态/图文对齐模型（如 CLIP/EVA-CLIP）的特征跨层对齐能力
+
+* 在多模态模型中，视觉编码器不同深度提取的信息（低层的“部件/边缘”、中层的“语义对象”、高层的“抽象概念”）需要与文本的跨粒度语义进行匹配。
+* **AttnRes 的增益**：在 CLIP 图像编码器中引入 AttnRes，可以使最终输出的 Visual Embedding 不再仅仅是最后一层 Feature 的简单加和，而是通过深度维度 Attention 动态聚合最贴合文本描述的那部分深度特征，有望显著提升零样本（Zero-Shot）识别与细粒度图文检索能力。
+
+#### 4. 在 Diffusion / DiT (Diffusion Transformer) 中缓解生成漂移
+
+* 生成模型（如 DiT）对深度特征的稳定性和多尺度控制要求极高。AttnRes 在 Block 级别（Block AttnRes）的选择性融合，有助于在生成过程中维持更平滑的隐空间轨迹，减少高层去噪过程对底层结构控制力的破坏。
+
+---
+
+### 三、 探索此方向潜在的挑战与工程陷阱
+
+在开展这项探索时，建议团队重点关注并预先应对以下痛点：
+
+1. **空间（Token）与深度（Depth）的双重 Softmax 交互风险**：
+* 2026 年近期的研究（如 *OASIS / AoS* 论文）指出，AttnRes 在双重 Softmax（Token 维度的 Self-Attention Softmax + Depth 维度的 AttnRes Softmax）耦合下，容易产生**注意力汇聚（Attention Sinks）与离群值（Outliers）放大效应**，可能影响量化与训练稳定性。在视觉任务（通常包含大量 background/blank patches）中，这一现象可能被放大。
+
+
+2. **显存与 IO 瓶颈（Patch 数目乘数效应）**：
+* ViT 的 Token 数（如 $14 \times 14 = 196$，高分辨率时可达 1024+）普遍多于短文本。Full AttnRes 需要保存所有历史层的 Activation，会带来极大的显存开销。必须采用 **Block AttnRes**（将 ViT 划分为 3~4 个 Stage/Block，跨 Block 做 AttnRes）结合 **Online Softmax Merge** 才能保证训练吞吐。
+
+
+
+---
+
+### 总结建议
+
+将 Kimi 的 **Attention Residuals 引入 Visual Foundation Models 是一个非常值得抢占先机的“蓝海”方向**。目前文献中针对 ViT 主干网络做 AttnRes 级联替换的系统性 benchmark（包含 ImageNet-1K Scaling, DINOv2 自监督蒸馏, 密集预测下游任务评估）尚留有极大的空白。建议从 **Block AttnRes + DINOv2 / DiT** 切入，验证其在深度 ViT 下能否突破经典加性残差的性能上限。

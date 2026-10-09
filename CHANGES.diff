@@ -1,0 +1,1472 @@
+diff --git a/RUN.md b/RUN.md
+index 64e3432..f1307ca 100644
+--- a/RUN.md
++++ b/RUN.md
+@@ -25,16 +25,20 @@ attnres/
+ 
+ ```bash
+ cd /path/to/attnres
+-bash scripts/setup_env.sh
++bash scripts/setup_env.sh          # 建 ./.venv（torch 2.10.0+cu128、vendored timm、attnres_vit）并跑冒烟测试
++source .venv/bin/activate          # 之后每次训练/评测前激活
+ ```
+ 
+-如果 conda 不可用，手动执行：
++为什么不用 conda / 直接 pip（147 上 2026-10 实测）：conda.anaconda.org 连不上、defaults 源需要接受服务条款；
++阿里云镜像对 HTTP/1.1（pip、uv 都走这个）限速到约 0.24 MB/s，而 HTTP/2（curl）有约 25 MB/s。
++所以脚本用 curl 下载 torch、torchvision 和 torch 锁定的 nvidia/triton 包，再用 uv 从本地文件安装。
++需要 CPython 3.13（默认 `~/miniconda3/bin/python3`，可用 `PYTHON=...` 指定）。
++
++测试：
+ 
+ ```bash
+-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+-pip install -e repos/timm
+-pip install -e .
+-python tests/test_forward.py   # 应输出 "All smoke tests passed."
++python tests/test_forward.py         # 所有模型前向 + 初始化时 AttnRes 与同权重 baseline 输出一致
++python tests/test_kimi_reference.py  # float64 下与 Kimi 论文 Fig. 2 伪代码逐行移植的实现一致
+ ```
+ 
+ ---
+@@ -68,6 +72,26 @@ sed -i 's|/data/imagenet|/mnt/datasets/imagenet|g' configs/phase0/*.yaml
+ sed -i 's|val_split: val|val_split: validation|g' configs/phase0/*.yaml
+ ```
+ 
++### 3.1 数据放本地盘（推荐）
++
++数据在 NAS 上时，每读一张图都要一次网络往返，147 上两个实验各只有约 350 张/秒（GPU 能跑约 1750）。
++推荐做法：`data_dir` 指向项目内的软链接目录，数据先用 NAS 上的，再拷一份到本地盘后无缝切换：
++
++```bash
++mkdir -p data/imagenet
++ln -s /mnt/a100b/default/wangjin/data/imagenet/train data/imagenet/train        # 147 上的 NAS 路径
++ln -s /mnt/a100b/default/wujiannan/data/imagenet-1k/val data/imagenet/val
++sed -i "s|^data_dir: /data/imagenet\$|data_dir: $PWD/data/imagenet|" configs/phase0/*.yaml
++
++# 拷到本地盘（在 tmux 里跑；训练集从整包 tar 流式解压，约 30 分钟）
++python scripts/data/extract_imagenet_train.py /mnt/a100b/default/wangjin/data/imagenet/ILSVRC2012_img_train.tar /mnt/d/bench/imagenet/train
++mkdir -p /mnt/d/bench/imagenet/val && (cd /mnt/a100b/default/wujiannan/data/imagenet-1k/val && ls | xargs -P 32 -I{} cp -r {} /mnt/d/bench/imagenet/val/)
++
++# 核对文件清单 + 抽查内容，一致才切换软链接；正在跑的实验下一次读文件就读本地，无需重启
++bash scripts/data/switch_to_local_data.sh /mnt/d/bench/imagenet \
++  /mnt/a100b/default/wangjin/data/imagenet/train /mnt/a100b/default/wujiannan/data/imagenet-1k/val
++```
++
+ ---
+ 
+ ## 4. Phase 0 实验矩阵
+@@ -89,14 +113,19 @@ sed -i 's|val_split: val|val_split: validation|g' configs/phase0/*.yaml
+ 
+ ## 5. 运行单个实验
+ 
++所有训练都在 tmux 里跑，SSH 断开不影响。
++
+ ```bash
+-# 语法: bash scripts/train_4gpu.sh <config.yaml> <gpu_ids> [额外参数]
++tmux new -s e01                  # 进入 tmux 后先 source .venv/bin/activate
+ 
++# 语法: bash scripts/train_4gpu.sh <config.yaml> <gpu_ids> [额外参数]
+ # 示例: E01 在 GPU 0-3 上训练
+ bash scripts/train_4gpu.sh configs/phase0/e01_d12_baseline.yaml 0,1,2,3
+ 
+-# 示例: 快速验证 (100 epochs)
+-bash scripts/train_4gpu.sh configs/phase0/e02_d12_attnres.yaml 4,5,6,7 --epochs 100
++# 示例: 快速验证 (100 epochs)，另开一个 tmux 会话跑；同机第二个任务换端口
++MASTER_PORT=29501 bash scripts/train_4gpu.sh configs/phase0/e02_d12_attnres.yaml 4,5,6,7 --epochs 100
++
++# 离开但不中断: Ctrl-b d；回来: tmux attach -t e01
+ ```
+ 
+ ### 5.1 随机种子与可复现性
+@@ -137,76 +166,89 @@ output/phase0/20261008_153045_e02_d12_attnres_s42/
+ | `run_manifest.json` | 启动时间、hostname、seed、GPU、git commit、额外 CLI 参数 |
+ | `config.yaml` | 本次运行使用的配置副本 |
+ | `args.yaml` | timm 解析后的完整训练参数 |
+-| `summary.csv` | 每个 epoch 的 train/eval 指标 |
+-| `checkpoint-{epoch}.pth.tar` | 周期性 checkpoint（保留最近 10 个） |
+-| `model_best.pth.tar` | 验证集最佳 checkpoint |
+-| `recovery-*.pth.tar` | 训练中断恢复用 |
+-| `events.out.tfevents.*` | TensorBoard 日志 |
++| `summary.csv` | 每个 epoch 的 train loss、lr 和 eval top1/top5（开了 EMA 时为 EMA 模型的指标） |
++| `last.pth.tar` | 最新 epoch 的完整状态，每个 epoch 覆盖 |
++| `checkpoint-{epoch}.pth.tar` | 按验证指标保留最好的 10 个 |
++| `model_best.pth.tar` | 验证集（EMA）最佳 checkpoint（评测、续训用） |
+ 
+ Checkpoint **文件名**沿用 timm 惯例（`checkpoint-290.pth.tar`），配置信息在**父目录名**中；完整配置见 `config.yaml` / `args.yaml`。
+ 
+-查看训练日志：
++查看训练日志（vendored timm 不支持 TensorBoard）：
+ 
+ ```bash
+-tensorboard --logdir output/phase0 --port 6006
++tail -f logs/phase0/e01_d12_baseline.log                                          # 实时输出
++column -s, -t < output/phase0/20261008_153045_e01_d12_baseline_s42/summary.csv    # 每 epoch 指标
+ ```
+ 
+ ---
+ 
+ ## 6. 双机 8+8 卡并行（推荐）
+ 
+-### 6.1 集群拓扑
++### 6.1 集群拓扑与排队
++
++每台机器开两个 tmux 队列，每个队列占 4 张卡、按顺序跑两个实验，前一个结束后立即接下一个：
+ 
+ ```
+-┌─────────────────────────────┐     ┌─────────────────────────────┐
+-│  Server A（8×A40）           │     │  Server B（8×A40）           │
+-│  GPU 0-3 → 实验 1           │     │  GPU 0-3 → 实验 3           │
+-│  GPU 4-7 → 实验 2           │     │  GPU 4-7 → 实验 4           │
+-└─────────────────────────────┘     └─────────────────────────────┘
++┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
++│  Server A（8×A40）                    │     │  Server B（8×A40）                    │
++│  GPU 0-3  p0_a_g0:  E01 → E07        │     │  GPU 0-3  p0_b_g0:  E03 → E05        │
++│  GPU 4-7  p0_a_g1:  E02 → E08        │     │  GPU 4-7  p0_b_g1:  E04 → E06        │
++└──────────────────────────────────────┘     └──────────────────────────────────────┘
+          各实验独立 4 卡 DDP，不需要跨机 torchrun
+ ```
+ 
++- baseline / AttnRes 成对实验始终在同一台机器上同时跑。
++- 最长的 d48 wide（E07/E08）排在最短的 d12 后面，两台机器负载接近（见 §9）；d12、d24 的结果最先出来。
++- 每个实验启动前，队列会等这 4 张卡的显存占用都低于 2000 MiB（每 5 秒查一次，可用 `GPU_FREE_MIB` / `GPU_POLL_SEC` 调整）：卡被别人占着就等，不会 OOM。
++- 某个实验失败时队列继续跑下一个，日志末尾记录 `END ... exit=<非 0>`；失败的实验之后用 §8 续训。
++
+ 每台服务器本地 GPU 编号均为 **0–7**。单实验只在**一台机器内**跑 4 卡 DDP，**不要**跨两台做 8 卡 DDP（Phase 0 不需要）。
+ 
+-### 6.2 Batch 1：E01–E04 四实验同时开跑
++### 6.2 启动
+ 
+-**在 Server A 上**（SSH 登录后）：
++**在 Server A 上**（SSH 登录并 `source .venv/bin/activate` 后）：
+ ```bash
+ cd /path/to/attnres
+-NODE=a bash scripts/run_phase0_node.sh 1
++NODE=a bash scripts/run_phase0_node.sh
+ ```
+ 
+-**在 Server B 上**（同时）：
++**在 Server B 上**：
+ ```bash
+ cd /path/to/attnres
+-NODE=b bash scripts/run_phase0_node.sh 1
++NODE=b bash scripts/run_phase0_node.sh
+ ```
+ 
+-| 服务器 | 实验 | 本地 GPU | 日志文件 |
+-|--------|------|----------|----------|
+-| A | E01 baseline d12 | 0,1,2,3 | `logs/phase0/e01_a.log` |
+-| A | E02 attnres d12 | 4,5,6,7 | `logs/phase0/e02_a.log` |
+-| B | E03 baseline d24 | 0,1,2,3 | `logs/phase0/e03_b.log` |
+-| B | E04 attnres d24 | 4,5,6,7 | `logs/phase0/e04_b.log` |
++脚本只创建 tmux 会话后立即返回，之后断开 SSH 不影响训练。
++
++若部分卡被别人占着，可按实际空闲情况指定两组卡，被占的那组会等卡空出后自动开始，例如：
++```bash
++GPUS_G0=0,5,6,7 GPUS_G1=1,2,3,4 NODE=a bash scripts/run_phase0_node.sh
++```
+ 
+-### 6.3 Batch 2：E05–E08
++| 服务器 | tmux 会话 | GPU | 实验（依次） | 日志 |
++|--------|-----------|-----|--------------|------|
++| A | `p0_a_g0` | 0-3 | E01 → E07 | `logs/phase0/e01_d12_baseline.log`、`e07_d48_wide_baseline.log` |
++| A | `p0_a_g1` | 4-7 | E02 → E08 | `logs/phase0/e02_d12_attnres.log`、`e08_d48_wide_attnres.log` |
++| B | `p0_b_g0` | 0-3 | E03 → E05 | `logs/phase0/e03_d24_baseline.log`、`e05_d48_narrow_baseline.log` |
++| B | `p0_b_g1` | 4-7 | E04 → E06 | `logs/phase0/e04_d24_attnres.log`、`e06_d48_narrow_attnres.log` |
+ 
+-Batch 1 全部结束后，同样在两台机器上分别执行：
++查看 / 停止：
+ 
+ ```bash
+-NODE=a bash scripts/run_phase0_node.sh 2   # E05 + E06 on Server A
+-NODE=b bash scripts/run_phase0_node.sh 2   # E07 + E08 on Server B
++tmux ls
++tmux attach -t p0_a_g0           # 退出查看但不中断: Ctrl-b d
++tmux kill-session -t p0_a_g0     # 停掉整条队列（含还没开始的实验）
+ ```
+ 
+-### 6.4 可选：从一台机器 SSH 分发
++### 6.3 可选：从一台机器 SSH 分发
+ 
+-若已配置免密 SSH，编辑 `scripts/cluster_dispatch.sh` 中的 `SERVER_A` / `SERVER_B` / `REMOTE_PROJECT`，然后：
++若已配置免密 SSH，编辑 `scripts/cluster_dispatch.sh` 中的 `SERVER_A` / `SERVER_B` / `REMOTE_PROJECT` / `REMOTE_ENV`（非交互 SSH 下激活环境的命令，默认 `source $REMOTE_PROJECT/.venv/bin/activate`），然后：
+ 
+ ```bash
+-bash scripts/cluster_dispatch.sh 1   # 向两台机器同时提交 Batch 1
++bash scripts/cluster_dispatch.sh   # 两台机器各起两个 tmux 队列
+ ```
+ 
+-### 6.5 输出目录与共享存储
++### 6.4 输出目录与共享存储
+ 
+ - **推荐**：两台机器挂载**同一 NFS**，`output/phase0/` 路径一致，结果自动汇总。
+ - **若无共享盘**：各机输出在本地，`run_manifest.json` 里有 `hostname` 字段可区分；训练完后 rsync 汇总：
+@@ -216,18 +258,33 @@ rsync -av server-a:/path/to/attnres/output/phase0/ ./output/phase0_from_a/
+ rsync -av server-b:/path/to/attnres/output/phase0/ ./output/phase0_from_b/
+ ```
+ 
+-### 6.6 同机双实验的端口隔离
++### 6.5 同机双队列的端口隔离
++
++同一台机器上的两个队列分别使用 `MASTER_PORT` 29500（GPU 0-3）和 29501（GPU 4-7），队列内的实验依次复用该端口，避免 torchrun 冲突。
++
++### 6.6 改代码后替换正在跑的实验
++
++先挂新任务、后停旧任务，中间不留空卡：
+ 
+-同一台 8 卡机器上并行 2 个 4 卡实验时，`run_phase0_node.sh` 会自动为每个实验分配不同的 `MASTER_PORT`（29500 / 29501），避免 torchrun 冲突。
++1. 代码检查、`py_compile`、小规模验证在旧任务还占着卡时做完；
++2. 新开 tmux 会话，挂上修复后的队列（它会一直等这 4 张卡空出来），队列里写上旧队列还没跑完的实验：
++   ```bash
++   tmux new -s fix_a_g1             # 进入后 source .venv/bin/activate
++   bash scripts/run_queue.sh 4,5,6,7 29511 configs/phase0/e02_d12_attnres.yaml configs/phase0/e08_d48_wide_attnres.yaml
++   # Ctrl-b d 离开
++   ```
++3. 确认新队列停在 `[WAIT]` 后，`tmux kill-session -t p0_a_g1` 停旧队列；新队列 5 秒内检测到空卡并启动。
+ 
+ ---
+ 
+ ## 7. 验证 / 评估 checkpoint
+ 
++评测的是 **EMA 权重**（`--use-ema`），与 `summary.csv` 里的 eval 指标、`model_best.pth.tar` 的选择口径一致。在 tmux 里运行：
++
+ ```bash
+ bash scripts/validate.sh \
+   configs/phase0/e02_d12_attnres.yaml \
+-  output/phase0/e02_d12_attnres/model_best.pth.tar \
++  output/phase0/20261008_153045_e02_d12_attnres_s42/model_best.pth.tar \
+   0
+ ```
+ 
+@@ -235,46 +292,36 @@ bash scripts/validate.sh \
+ 
+ ## 8. 断点续训
+ 
+-支持 timm 原生 `--resume`（恢复 model + optimizer + scaler + epoch + EMA）。
+-
+-**推荐方式**（自动定位 checkpoint、复用原 output 目录）：
++续训从**最佳 epoch**（`model_best.pth.tar`，按 EMA 验证指标选出）的下一个 epoch 继续，恢复 model + optimizer + scaler + epoch + EMA。需要从最新 epoch 接着跑时，第二个参数直接给 `last.pth.tar` 的路径。
+ 
+ ```bash
+-# 指定 checkpoint 文件
+-bash scripts/resume_4gpu.sh \
+-  configs/phase0/e01_d12_baseline.yaml \
+-  output/phase0/20261008_153045_e01_d12_baseline_s42/checkpoint-290.pth.tar \
+-  0,1,2,3
+-
+-# 或指定 run 目录（自动选最新 checkpoint-*）
++# 语法: bash scripts/resume_4gpu.sh <config.yaml> <run 目录或 checkpoint> [gpu_ids] [master_port]
+ bash scripts/resume_4gpu.sh \
+   configs/phase0/e01_d12_baseline.yaml \
+   output/phase0/20261008_153045_e01_d12_baseline_s42 \
+-  0,1,2,3
++  0,1,2,3 29500
+ ```
+ 
+-等价手动方式：
+-
+-```bash
+-RESUME=output/phase0/20261008_153045_e01_d12_baseline_s42/checkpoint-290.pth.tar \
+-  bash scripts/train_4gpu.sh configs/phase0/e01_d12_baseline.yaml 0,1,2,3
+-```
++脚本新建 tmux 会话 `resume_<run 目录名>`，等指定的卡空出后在原 run 目录里继续训练，日志追加到 `logs/phase0/<实验名>.log`。同机另一组卡上若有任务在跑，换一个端口（如 GPU 4-7 用 29501）。
+ 
+ ---
+ 
+ ## 9. 预期训练时间 (粗估)
+ 
+-| 模型 | 4×A40 吞吐 | 300 epoch 耗时 |
+-|------|-----------|---------------|
+-| d12 (E01/E02) | ~1200 img/s | ~1.5 天 |
+-| d24 (E03/E04) | ~800 img/s | ~2 天 |
+-| d48 narrow (E05/E06) | ~600 img/s | ~2.5 天 |
+-| d48 wide (E07/E08) | ~350 img/s | ~4 天 |
++每个实验 300 epoch + 10 cooldown epoch = 310 epoch，ImageNet 每 epoch 1.28M 张：
++
++| 模型 | 4×A40 吞吐（估计） | 310 epoch 耗时 |
++|------|-------------------|---------------|
++| d12 (E01/E02) | ~1200 img/s | ~3.8 天 |
++| d24 (E03/E04) | ~800 img/s | ~5.7 天 |
++| d48 narrow (E05/E06) | ~600 img/s | ~7.7 天 |
++| d48 wide (E07/E08) | ~350 img/s | ~13.1 天 |
++
++吞吐为估计值，开跑后以日志里第一个 epoch 的实际速度为准；前提是读数据不是瓶颈（数据在本地盘，见 §3.1）。147 上数据在 NAS 时实测每个实验只有约 350 张/秒，d12 一个实验就要约 13 天。按 §6 的队列：
+ 
+-双机并行下：
+-- **Batch 1**（E01–E04 同时跑）耗时 ≈ 最慢的那个实验（~2 天，取决于 E03/E04 d24）
+-- **Batch 2**（E05–E08 同时跑）耗时 ≈ ~4 天（受 E07/E08 d48 wide 限制）
+-- **总计约 6 天**（两批顺序执行），比单机 16 卡方案快一倍
++- **Server A**：E01/E02（~3.8 天）→ E07/E08（~13.1 天），约 **17 天**
++- **Server B**：E03/E04（~5.7 天）→ E05/E06（~7.7 天），约 **13.5 天**
++- **总计约 17 天**；d12 结果约第 4 天出，d24 约第 6 天出
+ 
+ ---
+ 
+@@ -307,13 +354,13 @@ A: 使用镜像：`git clone https://ghfast.top/https://github.com/xxx/yyy.git`
+ A: 确保通过 `train_imagenet.py` 启动（它会注册 AttnRes 模型），不要直接用 `repos/timm/train.py`。
+ 
+ **Q: 如何确认 AttnRes 生效？**  
+-A: 日志中 model summary 应显示 `attn_res` 模块；或运行：
++A: 每个子层（attn、MLP）前各一个 AttnRes，再加输出层一个，共 2×depth+1 个（d12 为 25）；`python tests/test_forward.py` 还会检查初始化时（pseudo-query 为 0）AttnRes 模型与同权重 baseline 输出一致：
+ ```python
+ python -c "
+ import attnres_vit
+ from timm.models import create_model
+ m = create_model('attnres_vit_d12_base_attnres')
+-print('AttnRes blocks:', len(m.attn_res))
++print('AttnRes modules:', len(m.attn_res))
+ "
+ ```
+ 
+diff --git a/attnres_vit/__pycache__/modules.cpython-313.pyc b/attnres_vit/__pycache__/modules.cpython-313.pyc
+new file mode 100644
+index 0000000..6bcc718
+Binary files /dev/null and b/attnres_vit/__pycache__/modules.cpython-313.pyc differ
+diff --git a/attnres_vit/__pycache__/vit.cpython-313.pyc b/attnres_vit/__pycache__/vit.cpython-313.pyc
+new file mode 100644
+index 0000000..5e53f50
+Binary files /dev/null and b/attnres_vit/__pycache__/vit.cpython-313.pyc differ
+diff --git a/attnres_vit/factory.py b/attnres_vit/factory.py
+index f90470f..ea20ddd 100644
+--- a/attnres_vit/factory.py
++++ b/attnres_vit/factory.py
+@@ -13,7 +13,6 @@ def _build(
+     num_heads: int,
+     use_attnres: bool,
+     num_blocks: int = 4,
+-    routing: str = "replace",
+     drop_path_rate: float = 0.1,
+     pretrained: bool = False,
+     **kwargs,
+@@ -34,7 +33,6 @@ def _build(
+         num_heads=num_heads,
+         use_attnres=use_attnres,
+         num_blocks=num_blocks,
+-        routing=routing,
+         drop_path_rate=drop_path_rate,
+         **model_kwargs,
+     )
+diff --git a/attnres_vit/modules.py b/attnres_vit/modules.py
+index 1861903..e35d6b5 100644
+--- a/attnres_vit/modules.py
++++ b/attnres_vit/modules.py
+@@ -9,6 +9,7 @@ from typing import List
+ 
+ import torch
+ import torch.nn as nn
++from torch.utils.checkpoint import checkpoint
+ 
+ 
+ class RMSNorm(nn.Module):
+@@ -24,42 +25,49 @@ class RMSNorm(nn.Module):
+         return x * norm * self.weight
+ 
+ 
++def _inv_rms(v: torch.Tensor, eps: float) -> torch.Tensor:
++    return v.pow(2).mean(dim=-1).add(eps).rsqrt()
++
++
++def inv_rms(v: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
++    """1 / RMS(v) over the last dim, [B, T] (autocast runs pow in fp32, as in RMSNorm). Under
++    autograd it is recomputed in backward, so no fp32 copy of a half-precision source stays alive."""
++    if torch.is_grad_enabled():
++        return checkpoint(_inv_rms, v, eps, use_reentrant=False)
++    return _inv_rms(v, eps)
++
++
+ class BlockAttnRes(nn.Module):
+-    """Block-level depth attention over completed block representations.
++    """Softmax attention over depth sources with a learned pseudo-query (paper Fig. 2).
++
++    Sources are [b_0 (token embedding), b_1, ..., b_{n-1}] plus, after the first sublayer
++    of a block, the partial sum b_n^i; each b is a sum of sublayer outputs. Keys are
++    RMSNorm(source); the pseudo-query is zero-initialized (paper Sec. 5), so the weights
++    start uniform.
+ 
+-    Each module attends over [completed_blocks..., partial_block] with a
+-    learned pseudo-query (Linear(hidden_dim, 1)).
++    Same function as stacking the sources and applying ``self.norm``, computed without the
++    [S, B, T, D] stack: the RMSNorm gain is folded into the query, w . (g * v * r) =
++    ((w * g) . v) * r, and r = 1 / RMS(v) is computed once per source by the caller.
+     """
+ 
+     def __init__(self, hidden_dim: int, norm_eps: float = 1e-5):
+         super().__init__()
+         self.proj = nn.Linear(hidden_dim, 1, bias=False)
+         self.norm = RMSNorm(hidden_dim, eps=norm_eps)
+-        nn.init.normal_(self.proj.weight, std=0.02)
++        nn.init.zeros_(self.proj.weight)
+ 
+     def forward(
+         self,
+-        blocks: List[torch.Tensor],
+-        partial_block: torch.Tensor,
+-        routing: str = "replace",
+-    ) -> torch.Tensor:
+-        """Aggregate depth-wise block representations.
+-
+-        Args:
+-            blocks: Completed block outputs, each [B, T, D].
+-            partial_block: Current block output [B, T, D].
+-            routing: ``replace`` (Kimi) or ``additive`` (Delta-style).
+-        """
+-        # [N+1, B, T, D]
+-        v = torch.stack(blocks + [partial_block], dim=0)
+-        k = self.norm(v)
+-        logits = torch.einsum("d, n b t d -> n b t", self.proj.weight.squeeze(0), k)
++        sources: List[torch.Tensor],
++        inv_rms: List[torch.Tensor],
++        return_alpha: bool = False,
++    ):
++        """Aggregate sources (each [B, T, D]) given their ``inv_rms`` ([B, T]); optionally
++        also return the weights [S, B, T]."""
++        q = self.proj.weight.squeeze(0) * self.norm.weight
++        logits = torch.stack([(v * q).sum(dim=-1) * r for v, r in zip(sources, inv_rms)])
+         alpha = logits.softmax(dim=0)
+-        aggregated = torch.einsum("n b t, n b t d -> b t d", alpha, v)
+-
+-        if routing == "additive":
+-            # Identity-preserving: keep current stream, add depth-routed correction.
+-            return partial_block + (aggregated - partial_block)
+-        if routing != "replace":
+-            raise ValueError(f"Unknown routing mode: {routing}")
+-        return aggregated
++        h = alpha[0].unsqueeze(-1) * sources[0]
++        for a, v in zip(alpha[1:], sources[1:]):
++            h = h + a.unsqueeze(-1) * v
++        return (h, alpha) if return_alpha else h
+diff --git a/attnres_vit/vit.py b/attnres_vit/vit.py
+index 4d04070..42326a9 100644
+--- a/attnres_vit/vit.py
++++ b/attnres_vit/vit.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from functools import partial
+-from typing import Optional, Tuple, Union
++from typing import List, Optional, Tuple, Union
+ 
+ import torch
+ import torch.nn as nn
+@@ -20,7 +20,7 @@ from timm.layers import (
+ )
+ from timm.models.vision_transformer import global_pool_nlc
+ 
+-from .modules import BlockAttnRes
++from .modules import BlockAttnRes, inv_rms
+ 
+ 
+ class ViTBlock(nn.Module):
+@@ -62,14 +62,25 @@ class ViTBlock(nn.Module):
+         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+ 
++    def attn_branch(self, x: torch.Tensor) -> torch.Tensor:
++        return self.drop_path1(self.ls1(self.attn(self.norm1(x))))
++
++    def mlp_branch(self, x: torch.Tensor) -> torch.Tensor:
++        return self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
++
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
++        x = x + self.attn_branch(x)
++        x = x + self.mlp_branch(x)
+         return x
+ 
+ 
+ class VisionTransformerAttnRes(nn.Module):
+-    """ViT backbone with optional Block AttnRes cross-block routing."""
++    """ViT backbone with optional Block AttnRes (Kimi Team, arXiv:2603.15031).
++
++    With AttnRes, every sublayer (attention and MLP) reads a softmax mixture of
++    [token embedding, completed block sums, current partial sum] instead of the
++    residual stream, and the final norm reads a mixture of all block sums.
++    """
+ 
+     def __init__(
+         self,
+@@ -89,7 +100,6 @@ class VisionTransformerAttnRes(nn.Module):
+         init_values: Optional[float] = None,
+         use_attnres: bool = False,
+         num_blocks: int = 4,
+-        routing: str = "replace",
+         global_pool: str = "token",
+     ) -> None:
+         super().__init__()
+@@ -102,7 +112,6 @@ class VisionTransformerAttnRes(nn.Module):
+         self.use_attnres = use_attnres
+         self.num_blocks = num_blocks
+         self.block_size = depth // num_blocks
+-        self.routing = routing
+         self.global_pool = global_pool
+         self.num_prefix_tokens = 1
+ 
+@@ -136,8 +145,9 @@ class VisionTransformerAttnRes(nn.Module):
+         ])
+ 
+         if use_attnres:
++            # One per sublayer (attn, MLP of each layer) plus one for the final output.
+             self.attn_res = nn.ModuleList([
+-                BlockAttnRes(embed_dim) for _ in range(num_blocks)
++                BlockAttnRes(embed_dim) for _ in range(2 * depth + 1)
+             ])
+         else:
+             self.attn_res = None
+@@ -150,6 +160,10 @@ class VisionTransformerAttnRes(nn.Module):
+         trunc_normal_(self.pos_embed, std=0.02)
+         trunc_normal_(self.cls_token, std=0.02)
+         self.apply(self._init_weights)
++        if self.attn_res is not None:
++            # Pseudo-queries must start at zero (uniform depth weights); _init_weights resets them.
++            for mod in self.attn_res:
++                nn.init.zeros_(mod.proj.weight)
+ 
+     @staticmethod
+     def _init_weights(m: nn.Module) -> None:
+@@ -168,6 +182,42 @@ class VisionTransformerAttnRes(nn.Module):
+         x = x + self.pos_embed
+         return self.pos_drop(x)
+ 
++    def _forward_attnres(
++        self, x: torch.Tensor, alphas: Optional[List[torch.Tensor]] = None
++    ) -> torch.Tensor:
++        """Block AttnRes forward (paper Eq. 5-6, Fig. 2); appends weights to ``alphas`` if given."""
++
++        def mix(idx: int, sources: List[torch.Tensor], rs: List[torch.Tensor]) -> torch.Tensor:
++            if alphas is None:
++                return self.attn_res[idx](sources, rs)
++            h, alpha = self.attn_res[idx](sources, rs, return_alpha=True)
++            alphas.append(alpha.detach())
++            return h
++
++        eps = self.attn_res[0].norm.eps
++        # b_0 = token embedding, then one sum of sublayer outputs per completed block;
++        # rs holds each source's 1 / RMS, computed once and shared by all later calls.
++        blocks, rs = [x], [inv_rms(x, eps)]
++        partial = r_partial = None  # sum of sublayer outputs in the current block
++        for i, blk in enumerate(self.blocks):
++            if partial is None:
++                h = mix(2 * i, blocks, rs)
++            else:
++                h = mix(2 * i, blocks + [partial], rs + [r_partial])
++            out = blk.attn_branch(h)
++            # Accumulate in the embedding's dtype (fp32 under AMP), like the baseline residual stream;
++            # summing fp16 sublayer outputs in fp16 overflowed in training (E02, 2026-10-09).
++            partial = out.to(x.dtype) if partial is None else partial + out
++            r_partial = inv_rms(partial, eps)
++            h = mix(2 * i + 1, blocks + [partial], rs + [r_partial])
++            partial = partial + blk.mlp_branch(h)
++            r_partial = inv_rms(partial, eps)
++            if (i + 1) % self.block_size == 0:
++                blocks.append(partial)
++                rs.append(r_partial)
++                partial = r_partial = None
++        return mix(2 * self.depth, blocks, rs)
++
+     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+         x = self.patch_embed(x)
+         x = self._pos_embed(x)
+@@ -177,14 +227,7 @@ class VisionTransformerAttnRes(nn.Module):
+             for blk in self.blocks:
+                 x = blk(x)
+         else:
+-            completed_blocks = [x]
+-            for block_idx in range(self.num_blocks):
+-                start = block_idx * self.block_size
+-                end = start + self.block_size
+-                for layer in self.blocks[start:end]:
+-                    x = layer(x)
+-                x = self.attn_res[block_idx](completed_blocks, x, routing=self.routing)
+-                completed_blocks.append(x)
++            x = self._forward_attnres(x)
+ 
+         return self.norm(x)
+ 
+@@ -201,29 +244,15 @@ class VisionTransformerAttnRes(nn.Module):
+         x = self.forward_features(x)
+         return self.forward_head(x)
+ 
+-    def get_routing_weights(self, x: torch.Tensor) -> list[torch.Tensor]:
+-        """Return depth-routing softmax weights per block (for visualization)."""
++    def get_routing_weights(self, x: torch.Tensor) -> List[torch.Tensor]:
++        """Return depth softmax weights [S, B, T] per AttnRes call (pre-attn, pre-MLP of
++        each layer, then the final output), for visualization."""
+         if not self.use_attnres:
+             return []
+ 
+-        weights = []
++        weights: List[torch.Tensor] = []
+         x = self.patch_embed(x)
+         x = self._pos_embed(x)
+         x = self.norm_pre(x)
+-
+-        completed_blocks = [x]
+-        for block_idx in range(self.num_blocks):
+-            start = block_idx * self.block_size
+-            end = start + self.block_size
+-            for layer in self.blocks[start:end]:
+-                x = layer(x)
+-
+-            mod = self.attn_res[block_idx]
+-            v = torch.stack(completed_blocks + [x], dim=0)
+-            k = mod.norm(v)
+-            logits = torch.einsum("d, n b t d -> n b t", mod.proj.weight.squeeze(0), k)
+-            alpha = logits.softmax(dim=0)
+-            weights.append(alpha.detach())
+-            x = mod(completed_blocks, x, routing=self.routing)
+-            completed_blocks.append(x)
++        self._forward_attnres(x, alphas=weights)
+         return weights
+diff --git a/configs/phase0/_base.yaml b/configs/phase0/_base.yaml
+index 96edddd..cfa760b 100644
+--- a/configs/phase0/_base.yaml
++++ b/configs/phase0/_base.yaml
+@@ -54,5 +54,4 @@ log_interval: 50
+ checkpoint_hist: 10
+ 
+ # Logging
+-tensorboard: true
+ log_wandb: false
+diff --git a/configs/phase0/e01_d12_baseline.yaml b/configs/phase0/e01_d12_baseline.yaml
+index 802b7cd..c431802 100644
+--- a/configs/phase0/e01_d12_baseline.yaml
++++ b/configs/phase0/e01_d12_baseline.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e02_d12_attnres.yaml b/configs/phase0/e02_d12_attnres.yaml
+index 01d0561..1e3a07e 100644
+--- a/configs/phase0/e02_d12_attnres.yaml
++++ b/configs/phase0/e02_d12_attnres.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e03_d24_baseline.yaml b/configs/phase0/e03_d24_baseline.yaml
+index c617aa4..e204c5c 100644
+--- a/configs/phase0/e03_d24_baseline.yaml
++++ b/configs/phase0/e03_d24_baseline.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e04_d24_attnres.yaml b/configs/phase0/e04_d24_attnres.yaml
+index 9a5627a..b70cc0d 100644
+--- a/configs/phase0/e04_d24_attnres.yaml
++++ b/configs/phase0/e04_d24_attnres.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e05_d48_narrow_baseline.yaml b/configs/phase0/e05_d48_narrow_baseline.yaml
+index 5caecdf..615d50e 100644
+--- a/configs/phase0/e05_d48_narrow_baseline.yaml
++++ b/configs/phase0/e05_d48_narrow_baseline.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e06_d48_narrow_attnres.yaml b/configs/phase0/e06_d48_narrow_attnres.yaml
+index f541b81..c2ef2d3 100644
+--- a/configs/phase0/e06_d48_narrow_attnres.yaml
++++ b/configs/phase0/e06_d48_narrow_attnres.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e07_d48_wide_baseline.yaml b/configs/phase0/e07_d48_wide_baseline.yaml
+index abe2fdf..558b98c 100644
+--- a/configs/phase0/e07_d48_wide_baseline.yaml
++++ b/configs/phase0/e07_d48_wide_baseline.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/e08_d48_wide_attnres.yaml b/configs/phase0/e08_d48_wide_attnres.yaml
+index 61953a4..5070812 100644
+--- a/configs/phase0/e08_d48_wide_attnres.yaml
++++ b/configs/phase0/e08_d48_wide_attnres.yaml
+@@ -35,4 +35,3 @@ pin_mem: true
+ prefetcher: true
+ log_interval: 50
+ checkpoint_hist: 10
+-tensorboard: true
+diff --git a/configs/phase0/smoke_test.yaml b/configs/phase0/smoke_test.yaml
+index f4804b8..01f7c25 100644
+--- a/configs/phase0/smoke_test.yaml
++++ b/configs/phase0/smoke_test.yaml
+@@ -20,4 +20,3 @@ warmup_epochs: 0
+ amp: true
+ workers: 4
+ log_interval: 10
+-tensorboard: false
+diff --git a/scripts/cluster_dispatch.sh b/scripts/cluster_dispatch.sh
+index 076430e..b3001d7 100644
+--- a/scripts/cluster_dispatch.sh
++++ b/scripts/cluster_dispatch.sh
+@@ -1,14 +1,12 @@
+ #!/usr/bin/env bash
+-# Optional: dispatch Phase-0 jobs to two servers via SSH.
++# Optional: start the Phase-0 tmux queues on both servers via SSH.
+ #
+-# Edit SERVER_A / SERVER_B and REMOTE_PROJECT before use.
+-# Requires: passwordless SSH, identical project path on both nodes,
+-#           shared filesystem for output (NFS) OR accept per-node local output.
++# Edit SERVER_A / SERVER_B / REMOTE_PROJECT / REMOTE_ENV before use.
++# Requires passwordless SSH and the project at the same path on both nodes.
++# REMOTE_ENV must put the project's python / torchrun on PATH in a non-interactive SSH shell.
+ #
+ # Usage:
+-#   bash scripts/cluster_dispatch.sh 1    # dispatch batch 1 to both nodes
+-#   bash scripts/cluster_dispatch.sh 2    # dispatch batch 2
+-#   bash scripts/cluster_dispatch.sh all  # batch 1 then batch 2
++#   bash scripts/cluster_dispatch.sh
+ 
+ set -euo pipefail
+ 
+@@ -16,25 +14,9 @@ set -euo pipefail
+ SERVER_A="${SERVER_A:-user@server-a}"
+ SERVER_B="${SERVER_B:-user@server-b}"
+ REMOTE_PROJECT="${REMOTE_PROJECT:-/path/to/attnres}"
++REMOTE_ENV="${REMOTE_ENV:-source $REMOTE_PROJECT/.venv/bin/activate}"
+ # --------------------------------
+ 
+-BATCH="${1:-1}"
+-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+-
+-dispatch() {
+-  local batch="$1"
+-  echo ">>> Dispatching batch $batch to cluster..."
+-  ssh "$SERVER_A" "cd $REMOTE_PROJECT && NODE=a nohup bash scripts/run_phase0_node.sh $batch \
+-    > logs/phase0/dispatch_a_b${batch}.log 2>&1 &"
+-  ssh "$SERVER_B" "cd $REMOTE_PROJECT && NODE=b nohup bash scripts/run_phase0_node.sh $batch \
+-    > logs/phase0/dispatch_b_b${batch}.log 2>&1 &"
+-  echo ">>> Jobs submitted. Monitor:"
+-  echo "    ssh $SERVER_A tail -f $REMOTE_PROJECT/logs/phase0/e01_a.log  # etc."
+-  echo "    ssh $SERVER_B tail -f $REMOTE_PROJECT/logs/phase0/e03_b.log"
+-}
+-
+-case "$BATCH" in
+-  1|2) dispatch "$BATCH" ;;
+-  all) dispatch 1; echo "Waiting for batch 1... (poll manually)"; dispatch 2 ;;
+-  *) echo "Usage: $0 {1|2|all}"; exit 1 ;;
+-esac
++ssh "$SERVER_A" "$REMOTE_ENV && cd $REMOTE_PROJECT && NODE=a bash scripts/run_phase0_node.sh"
++ssh "$SERVER_B" "$REMOTE_ENV && cd $REMOTE_PROJECT && NODE=b bash scripts/run_phase0_node.sh"
++echo ">>> Queues started. Check: ssh $SERVER_A tmux ls ; ssh $SERVER_B tmux ls"
+diff --git a/scripts/data/__pycache__/extract_imagenet_train.cpython-313.pyc b/scripts/data/__pycache__/extract_imagenet_train.cpython-313.pyc
+new file mode 100644
+index 0000000..e14e953
+Binary files /dev/null and b/scripts/data/__pycache__/extract_imagenet_train.cpython-313.pyc differ
+diff --git a/scripts/data/extract_imagenet_train.py b/scripts/data/extract_imagenet_train.py
+new file mode 100644
+index 0000000..fcdaa2d
+--- /dev/null
++++ b/scripts/data/extract_imagenet_train.py
+@@ -0,0 +1,34 @@
++"""Stream-extract ILSVRC2012_img_train.tar (1000 per-class tars) from the NAS straight into
++<dst>/<wnid>/<file>.JPEG on local disk: one sequential NAS read, no intermediate tar files.
++
++Usage: python scripts/data/extract_imagenet_train.py <ILSVRC2012_img_train.tar> <dst train dir>
++Prints progress every 50 classes and a final "DONE ..." line (~80 MiB/s from the NAS on 147).
++"""
++import os
++import shutil
++import sys
++import tarfile
++import time
++
++src, dst = sys.argv[1], sys.argv[2]
++os.makedirs(dst, exist_ok=False)
++t0, n_cls, n_img, n_bytes = time.time(), 0, 0, 0
++with tarfile.open(src, mode="r|") as outer:
++    for member in outer:
++        if not (member.isfile() and member.name.endswith(".tar")):
++            continue
++        wnid = os.path.basename(member.name)[: -len(".tar")]
++        os.makedirs(os.path.join(dst, wnid))
++        with tarfile.open(fileobj=outer.extractfile(member), mode="r|") as inner:
++            for im in inner:
++                if not im.isfile():
++                    continue
++                with inner.extractfile(im) as fin, open(os.path.join(dst, wnid, os.path.basename(im.name)), "wb") as fout:
++                    shutil.copyfileobj(fin, fout, 1 << 20)
++                n_img += 1
++                n_bytes += im.size
++        n_cls += 1
++        if n_cls % 50 == 0:
++            dt = time.time() - t0
++            print(f"{n_cls} classes, {n_img} images, {n_bytes / 2**30:.1f} GiB, {dt / 60:.1f} min, {n_bytes / 2**20 / dt:.0f} MiB/s", flush=True)
++print(f"DONE {n_cls} classes, {n_img} images, {n_bytes / 2**30:.1f} GiB in {(time.time() - t0) / 60:.1f} min", flush=True)
+diff --git a/scripts/data/switch_to_local_data.sh b/scripts/data/switch_to_local_data.sh
+new file mode 100644
+index 0000000..96edd94
+--- /dev/null
++++ b/scripts/data/switch_to_local_data.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++# Verify a local ImageNet copy against the NAS folders, then atomically repoint the training
++# data symlinks (<data_dir>/train, <data_dir>/val) at it. Running jobs read the local copy from
++# their next file open: timm keeps the symlinked paths, so no restart is needed.
++# Nothing is switched if the file lists differ or a sampled file's content differs.
++#
++# Usage:
++#   bash scripts/data/switch_to_local_data.sh <local_root> <nas_train_dir> <nas_val_dir> [data_dir]
++#     local_root  directory holding train/ and val/ (e.g. /mnt/d/bench/imagenet)
++#     data_dir    folder with the train/val symlinks used as data_dir (default <project>/data/imagenet)
++#
++# Example (147):
++#   bash scripts/data/switch_to_local_data.sh /mnt/d/bench/imagenet \
++#     /mnt/a100b/default/wangjin/data/imagenet/train /mnt/a100b/default/wujiannan/data/imagenet-1k/val
++set -euo pipefail
++
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
++LOCAL="$1"
++NAS_TRAIN="$2"
++NAS_VAL="$3"
++DATA_DIR="${4:-$PROJECT_ROOT/data/imagenet}"
++LISTS="$PROJECT_ROOT/logs/setup"
++mkdir -p "$LISTS"
++
++for split in train val; do
++  nas="$NAS_TRAIN"
++  [[ $split == val ]] && nas="$NAS_VAL"
++  (cd "$nas" && find . -type f | sort) > "$LISTS/nas_${split}_list.txt"
++  (cd "$LOCAL/$split" && find . -type f | sort) > "$LISTS/local_${split}_list.txt"
++  echo "$split: NAS $(wc -l < "$LISTS/nas_${split}_list.txt") files / local $(wc -l < "$LISTS/local_${split}_list.txt") files"
++  if ! cmp -s "$LISTS/nas_${split}_list.txt" "$LISTS/local_${split}_list.txt"; then
++    echo "[ERROR] $split file lists differ; not switching"
++    exit 1
++  fi
++  while read -r f; do
++    if ! cmp -s "$nas/$f" "$LOCAL/$split/$f"; then
++      echo "[ERROR] content differs: $split/$f; not switching"
++      exit 1
++    fi
++  done < <(shuf -n 200 "$LISTS/local_${split}_list.txt")
++done
++echo "file lists identical, 400 sampled files identical"
++
++cd "$DATA_DIR"
++for split in train val; do
++  ln -s "$LOCAL/$split" "$split.local"
++  mv -T "$split.local" "$split"
++done
++echo "[$(date '+%F %T')] switched $DATA_DIR to $LOCAL"
++ls -l "$DATA_DIR"
+diff --git a/scripts/lib/__pycache__/fetch_torch_deps.cpython-313.pyc b/scripts/lib/__pycache__/fetch_torch_deps.cpython-313.pyc
+new file mode 100644
+index 0000000..8c70e5c
+Binary files /dev/null and b/scripts/lib/__pycache__/fetch_torch_deps.cpython-313.pyc differ
+diff --git a/scripts/lib/fetch_torch_deps.py b/scripts/lib/fetch_torch_deps.py
+new file mode 100644
+index 0000000..e396850
+--- /dev/null
++++ b/scripts/lib/fetch_torch_deps.py
+@@ -0,0 +1,52 @@
++"""Download torch's pinned Linux x86_64 dependency wheels (nvidia-*, triton, cuda-bindings) with curl.
++
++On 147 the Aliyun mirrors throttle HTTP/1.1 (what pip and uv speak) to ~0.24 MB/s but serve HTTP/2
++(curl) at ~25 MB/s, so these large wheels are fetched here and installed from local files.
++
++Usage: python scripts/lib/fetch_torch_deps.py <torch wheel> <dest dir>
++Env:   PIP_INDEX  PEP 503 simple index (default https://mirrors.aliyun.com/pypi/simple/)
++"""
++import os
++import re
++import subprocess
++import sys
++import zipfile
++from pathlib import Path
++
++SIMPLE = os.environ.get("PIP_INDEX", "https://mirrors.aliyun.com/pypi/simple/").rstrip("/")
++PACKAGES = SIMPLE.rsplit("/simple", 1)[0] + "/packages"
++
++
++def fits_cp313_x86_64(filename: str) -> bool:
++    """Wheel tags installable on CPython 3.13 (non free-threaded), manylinux x86_64."""
++    py, abi, plat = filename[: -len(".whl")].split("-")[-3:]
++    if "manylinux" not in plat or "x86_64" not in plat:
++        return False
++    if abi == "abi3":
++        return py.startswith("cp3") and int(py[3:]) <= 13
++    return (py, abi) in {("py3", "none"), ("py2.py3", "none"), ("cp313", "cp313")}
++
++
++torch_whl, dest = Path(sys.argv[1]), Path(sys.argv[2])
++with zipfile.ZipFile(torch_whl) as zf:
++    meta_name = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
++    meta = zf.read(meta_name).decode()
++
++pins = []
++for line in meta.splitlines():
++    m = re.match(r"Requires-Dist: ([A-Za-z0-9_.\-]+)==([^\s;]+)\s*;?(.*)", line)
++    if m and "extra ==" not in m.group(3) and "Linux" in m.group(3):
++        pins.append((m.group(1), m.group(2)))
++
++for name, version in pins:
++    index = subprocess.run(["curl", "-fsSL", f"{SIMPLE}/{name.lower()}/"], capture_output=True, text=True, check=True).stdout
++    stem = re.sub(r"[-_.]+", "_", name).lower() + "-" + version + "-"
++    hrefs = [h for h in re.findall(r'href="([^"#]+\.whl)', index)
++             if Path(h).name.lower().startswith(stem) and fits_cp313_x86_64(Path(h).name)]
++    if not hrefs:
++        raise SystemExit(f"no Linux x86_64 wheel for {name}=={version}")
++    href = hrefs[-1]
++    url = PACKAGES + "/" + href.split("/packages/", 1)[1]
++    out = dest / Path(href).name
++    subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", str(out), url], check=True)
++    print(f"{name}=={version}  {out.stat().st_size / 1e6:8.1f} MB  {out.name}", flush=True)
+diff --git a/scripts/lib/run_utils.sh b/scripts/lib/run_utils.sh
+index 545434e..1aa3503 100644
+--- a/scripts/lib/run_utils.sh
++++ b/scripts/lib/run_utils.sh
+@@ -23,6 +23,49 @@ build_run_name() {
+   echo "${run_id}_${slug}_s${seed}"
+ }
+ 
++# Block until every GPU in a comma list uses < GPU_FREE_MIB MiB (default 2000),
++# polling every GPU_POLL_SEC seconds (default 5).
++wait_gpus_free() {
++  local gpus="$1"
++  local limit="${GPU_FREE_MIB:-2000}"
++  local poll="${GPU_POLL_SEC:-5}"
++  local announced=0 g used busy
++  while true; do
++    busy=""
++    for g in ${gpus//,/ }; do
++      used="$(nvidia-smi --id="$g" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')"
++      if (( used >= limit )); then
++        busy="$g"
++        break
++      fi
++    done
++    [[ -z "$busy" ]] && return 0
++    if (( announced == 0 )); then
++      echo "[WAIT] GPU $busy busy (>= ${limit} MiB); polling every ${poll}s until GPUs $gpus are free"
++      announced=1
++    fi
++    sleep "$poll"
++  done
++}
++
++# Start a detached tmux session running a command from PROJECT_ROOT.
++# PATH / LD_LIBRARY_PATH are passed explicitly: an already-running tmux server would
++# otherwise give the session its own (possibly wrong) conda environment.
++tmux_launch() {
++  local session="$1"
++  shift
++  if tmux has-session -t "=$session" 2>/dev/null; then
++    echo "[ERROR] tmux session '$session' already exists (tmux attach -t $session)"
++    exit 1
++  fi
++  local env_cmd="export PATH=$(printf '%q' "$PATH");"
++  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
++    env_cmd+=" export LD_LIBRARY_PATH=$(printf '%q' "$LD_LIBRARY_PATH");"
++  fi
++  tmux new-session -d -s "$session" -c "$PROJECT_ROOT" "$env_cmd $(printf '%q ' "$@")"
++  echo "[INFO] tmux session '$session' started (tmux attach -t $session)"
++}
++
+ # Refuse to clobber an existing run unless FORCE=1.
+ assert_output_safe() {
+   local outdir="$1"
+diff --git a/scripts/resume_4gpu.sh b/scripts/resume_4gpu.sh
+index edb5c55..93ccfd7 100644
+--- a/scripts/resume_4gpu.sh
++++ b/scripts/resume_4gpu.sh
+@@ -1,38 +1,43 @@
+ #!/usr/bin/env bash
+-# Resume a previous run on 4 GPUs.
++# Resume a run from its best epoch inside tmux, writing into the same run directory.
+ #
+ # Usage:
+-#   bash scripts/resume_4gpu.sh <config.yaml> <run_output_dir> [gpu_ids] [extra args...]
++#   bash scripts/resume_4gpu.sh <config.yaml> <run_dir | checkpoint.pth.tar> [gpu_ids] [master_port]
+ #
+ # Example:
+ #   bash scripts/resume_4gpu.sh configs/phase0/e01_d12_baseline.yaml \
+-#     output/phase0/20261008_153045_e01_d12_baseline_s42/checkpoint-290.pth.tar 0,1,2,3
++#     output/phase0/20261008_153045_e01_d12_baseline_s42 0,1,2,3 29500
+ #
+-# If checkpoint is a directory, uses model_best.pth.tar inside it.
++# A run directory resolves to model_best.pth.tar (best eval epoch, EMA metric); training
++# continues from the epoch after it. Pass last.pth.tar explicitly to continue from the latest epoch.
+ 
+ set -euo pipefail
+ 
+ if [[ $# -lt 2 ]]; then
+-  echo "Usage: $0 <config.yaml> <checkpoint_or_run_dir> [gpu_ids] [extra args...]"
++  echo "Usage: $0 <config.yaml> <run_dir | checkpoint.pth.tar> [gpu_ids] [master_port]"
+   exit 1
+ fi
+ 
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++# shellcheck disable=SC1091
++source "$PROJECT_ROOT/scripts/lib/run_utils.sh"
++
+ CONFIG="$1"
+ CKPT="$2"
+-shift 2
++GPUS="${3:-0,1,2,3}"
++PORT="${4:-29500}"
+ 
+ if [[ -d "$CKPT" ]]; then
+-  if [[ -f "$CKPT/model_best.pth.tar" ]]; then
+-    CKPT="$CKPT/model_best.pth.tar"
+-  elif compgen -G "$CKPT/checkpoint-*.pth.tar" > /dev/null; then
+-    CKPT="$(ls -t "$CKPT"/checkpoint-*.pth.tar | head -1)"
+-  else
+-    echo "[ERROR] No checkpoint found in directory: $CKPT"
+-    exit 1
+-  fi
++  CKPT="$CKPT/model_best.pth.tar"
++fi
++if [[ ! -f "$CKPT" ]]; then
++  echo "[ERROR] Checkpoint not found: $CKPT"
++  exit 1
+ fi
+ 
+-export RESUME="$CKPT"
+-export FORCE=1
++# Absolute paths: the tmux session starts in PROJECT_ROOT.
++CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
++CKPT="$(cd "$(dirname "$CKPT")" && pwd)/$(basename "$CKPT")"
+ 
+-bash "$(dirname "$0")/train_4gpu.sh" "$CONFIG" "$@"
++tmux_launch "resume_$(basename "$(dirname "$CKPT")")" \
++  env RESUME="$CKPT" bash scripts/run_queue.sh "$GPUS" "$PORT" "$CONFIG"
+diff --git a/scripts/run_phase0_node.sh b/scripts/run_phase0_node.sh
+index c258800..4b6bbff 100644
+--- a/scripts/run_phase0_node.sh
++++ b/scripts/run_phase0_node.sh
+@@ -1,75 +1,56 @@
+ #!/usr/bin/env bash
+-# Launch Phase-0 experiments on ONE 8-GPU server (2 experiments × 4 GPUs).
++# Launch Phase-0 on ONE 8-GPU server as two tmux queues (GPU 0-3 / GPU 4-7).
+ #
+-# Cluster layout (2 servers × 8 A40, 16 GPUs total):
+-#   NODE=a  Server A:  Batch1 → E01(0-3) + E02(4-7)   Batch2 → E05(0-3) + E06(4-7)
+-#   NODE=b  Server B:  Batch1 → E03(0-3) + E04(4-7)   Batch2 → E07(0-3) + E08(4-7)
++# Cluster layout (2 servers x 8 A40). Each queue runs its jobs back-to-back:
++#   NODE=a  GPU 0-3: E01 -> E07     GPU 4-7: E02 -> E08
++#   NODE=b  GPU 0-3: E03 -> E05     GPU 4-7: E04 -> E06
+ #
+-# With both servers running batch 1 (or 2) at the same time, all 4 experiments
+-# in that batch finish in parallel — no need to wait for sequential waves.
++# Baseline/AttnRes pairs still run side by side on the same server. The two longest
++# jobs (d48 wide, ~13 d) follow the two shortest (d12, ~4 d), so both servers finish
++# in ~17 d / ~13.5 d instead of ~11.5 d / ~19 d, and no GPU waits between jobs.
+ #
+-# Usage (run on each server separately, e.g. via SSH):
+-#   NODE=a bash scripts/run_phase0_node.sh 1
+-#   NODE=b bash scripts/run_phase0_node.sh 1
+-#   NODE=a bash scripts/run_phase0_node.sh 2
+-#   NODE=b bash scripts/run_phase0_node.sh 2
++# Usage (on each server, with the project's venv active: source .venv/bin/activate):
++#   NODE=a bash scripts/run_phase0_node.sh
++#   NODE=b bash scripts/run_phase0_node.sh
++#
++# Monitor:
++#   tmux ls
++#   tmux attach -t p0_a_g0                      # detach: Ctrl-b d
++#   tail -f logs/phase0/e01_d12_baseline.log
++# Stop a whole queue:
++#   tmux kill-session -t p0_a_g0
+ #
+ # Environment:
+ #   NODE=a|b          Required. Which server this is.
+-#   MASTER_PORT_BASE  Base port for torchrun (default 29500). Job1 uses BASE, job2 uses BASE+1.
++#   GPUS_G0 / GPUS_G1 GPU ids of the two queues (default 0,1,2,3 / 4,5,6,7), e.g. GPUS_G0=0,5,6,7
++#                     GPUS_G1=1,2,3,4 when another user holds GPU 1-4: queue g1 then waits for them.
++#   MASTER_PORT_BASE  torchrun port of queue g0 (default 29500); queue g1 uses BASE+1.
+ 
+ set -euo pipefail
+ 
+ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+-BATCH="${1:-1}"
+-NODE="${NODE:-}"
+-LOG_DIR="$PROJECT_ROOT/logs/phase0"
+-MASTER_PORT_BASE="${MASTER_PORT_BASE:-29500}"
+-
+-if [[ -z "$NODE" ]]; then
+-  echo "[ERROR] Set NODE=a or NODE=b to identify this server."
+-  echo "  Example: NODE=a bash scripts/run_phase0_node.sh 1"
+-  exit 1
+-fi
+-
+-mkdir -p "$LOG_DIR"
+-
+-launch_pair() {
+-  local cfg1="$1" gpus1="$2" log1="$3" port1="$4"
+-  local cfg2="$5" gpus2="$6" log2="$7" port2="$8"
+-
+-  echo ">>> [$NODE] $(basename "$cfg1" .yaml) on GPU $gpus1 (port $port1)"
+-  echo ">>> [$NODE] $(basename "$cfg2" .yaml) on GPU $gpus2 (port $port2)"
++# shellcheck disable=SC1091
++source "$PROJECT_ROOT/scripts/lib/run_utils.sh"
+ 
+-  MASTER_PORT="$port1" bash "$PROJECT_ROOT/scripts/train_4gpu.sh" "$cfg1" "$gpus1" \
+-    > "$LOG_DIR/${log1}_${NODE}.log" 2>&1 &
+-  pid1=$!
+-
+-  MASTER_PORT="$port2" bash "$PROJECT_ROOT/scripts/train_4gpu.sh" "$cfg2" "$gpus2" \
+-    > "$LOG_DIR/${log2}_${NODE}.log" 2>&1 &
+-  pid2=$!
+-
+-  wait "$pid1" "$pid2"
+-  echo ">>> [$NODE] pair finished: $log1, $log2"
+-}
++NODE="${NODE:-}"
++BASE="${MASTER_PORT_BASE:-29500}"
++C=configs/phase0
+ 
+-case "$NODE:$BATCH" in
+-  a:1) launch_pair \
+-    configs/phase0/e01_d12_baseline.yaml 0,1,2,3 e01 "$MASTER_PORT_BASE" \
+-    configs/phase0/e02_d12_attnres.yaml  4,5,6,7 e02 "$((MASTER_PORT_BASE + 1))" ;;
+-  b:1) launch_pair \
+-    configs/phase0/e03_d24_baseline.yaml 0,1,2,3 e03 "$MASTER_PORT_BASE" \
+-    configs/phase0/e04_d24_attnres.yaml  4,5,6,7 e04 "$((MASTER_PORT_BASE + 1))" ;;
+-  a:2) launch_pair \
+-    configs/phase0/e05_d48_narrow_baseline.yaml 0,1,2,3 e05 "$MASTER_PORT_BASE" \
+-    configs/phase0/e06_d48_narrow_attnres.yaml  4,5,6,7 e06 "$((MASTER_PORT_BASE + 1))" ;;
+-  b:2) launch_pair \
+-    configs/phase0/e07_d48_wide_baseline.yaml 0,1,2,3 e07 "$MASTER_PORT_BASE" \
+-    configs/phase0/e08_d48_wide_attnres.yaml  4,5,6,7 e08 "$((MASTER_PORT_BASE + 1))" ;;
++case "$NODE" in
++  a)
++    Q0=("$C/e01_d12_baseline.yaml" "$C/e07_d48_wide_baseline.yaml")
++    Q1=("$C/e02_d12_attnres.yaml" "$C/e08_d48_wide_attnres.yaml")
++    ;;
++  b)
++    Q0=("$C/e03_d24_baseline.yaml" "$C/e05_d48_narrow_baseline.yaml")
++    Q1=("$C/e04_d24_attnres.yaml" "$C/e06_d48_narrow_attnres.yaml")
++    ;;
+   *)
+-    echo "[ERROR] Unknown NODE=$NODE BATCH=$BATCH (use BATCH=1 or 2)"
++    echo "[ERROR] Set NODE=a or NODE=b to identify this server."
++    echo "  Example: NODE=a bash scripts/run_phase0_node.sh"
+     exit 1
+     ;;
+ esac
+ 
+-echo "[$NODE] Batch $BATCH complete."
++tmux_launch "p0_${NODE}_g0" bash scripts/run_queue.sh "${GPUS_G0:-0,1,2,3}" "$BASE" "${Q0[@]}"
++tmux_launch "p0_${NODE}_g1" bash scripts/run_queue.sh "${GPUS_G1:-4,5,6,7}" "$((BASE + 1))" "${Q1[@]}"
+diff --git a/scripts/run_phase0_parallel.sh b/scripts/run_phase0_parallel.sh
+deleted file mode 100644
+index f6887a5..0000000
+--- a/scripts/run_phase0_parallel.sh
++++ /dev/null
+@@ -1,52 +0,0 @@
+-#!/usr/bin/env bash
+-# [DEPRECATED on multi-node] Single-machine 16-GPU launcher.
+-#
+-# Your cluster is 2×8 GPUs on separate servers. Use run_phase0_node.sh instead:
+-#   NODE=a bash scripts/run_phase0_node.sh 1   # on server A
+-#   NODE=b bash scripts/run_phase0_node.sh 1   # on server B (same time)
+-#
+-# This script remains for a hypothetical single 16-GPU box.
+-
+-set -euo pipefail
+-
+-echo "[WARN] Detected run_phase0_parallel.sh — intended for single 16-GPU node."
+-echo "[WARN] For 2×8-GPU cluster, use: NODE=a|b bash scripts/run_phase0_node.sh {1|2}"
+-echo ""
+-
+-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+-BATCH="${1:-all}"
+-LOG_DIR="$PROJECT_ROOT/logs/phase0"
+-mkdir -p "$LOG_DIR"
+-
+-run_batch1() {
+-  echo ">>> Batch 1: E01-E04"
+-  MASTER_PORT=29501 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e01_d12_baseline.yaml 0,1,2,3 \
+-    > "$LOG_DIR/e01.log" 2>&1 &
+-  MASTER_PORT=29502 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e02_d12_attnres.yaml 4,5,6,7 \
+-    > "$LOG_DIR/e02.log" 2>&1 &
+-  MASTER_PORT=29503 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e03_d24_baseline.yaml 8,9,10,11 \
+-    > "$LOG_DIR/e03.log" 2>&1 &
+-  MASTER_PORT=29504 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e04_d24_attnres.yaml 12,13,14,15 \
+-    > "$LOG_DIR/e04.log" 2>&1 &
+-  wait
+-}
+-
+-run_batch2() {
+-  echo ">>> Batch 2: E05-E08"
+-  MASTER_PORT=29501 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e05_d48_narrow_baseline.yaml 0,1,2,3 \
+-    > "$LOG_DIR/e05.log" 2>&1 &
+-  MASTER_PORT=29502 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e06_d48_narrow_attnres.yaml 4,5,6,7 \
+-    > "$LOG_DIR/e06.log" 2>&1 &
+-  MASTER_PORT=29503 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e07_d48_wide_baseline.yaml 8,9,10,11 \
+-    > "$LOG_DIR/e07.log" 2>&1 &
+-  MASTER_PORT=29504 bash "$PROJECT_ROOT/scripts/train_4gpu.sh" configs/phase0/e08_d48_wide_attnres.yaml 12,13,14,15 \
+-    > "$LOG_DIR/e08.log" 2>&1 &
+-  wait
+-}
+-
+-case "$BATCH" in
+-  1) run_batch1 ;;
+-  2) run_batch2 ;;
+-  all) run_batch1; run_batch2 ;;
+-  *) echo "Usage: $0 {1|2|all}"; exit 1 ;;
+-esac
+diff --git a/scripts/run_queue.sh b/scripts/run_queue.sh
+new file mode 100644
+index 0000000..177db0c
+--- /dev/null
++++ b/scripts/run_queue.sh
+@@ -0,0 +1,36 @@
++#!/usr/bin/env bash
++# Run configs back-to-back on one 4-GPU group. Meant to live inside tmux
++# (started by run_phase0_node.sh / resume_4gpu.sh).
++#
++# Before each job it waits until the GPUs are free; a failed job does not stop the queue.
++#
++# Usage:
++#   bash scripts/run_queue.sh <gpu_ids> <master_port> <config.yaml> [config.yaml ...]
++#
++# Log: logs/phase0/<config name>.log (appended)
++
++PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++# shellcheck disable=SC1091
++source "$PROJECT_ROOT/scripts/lib/run_utils.sh"
++set +e  # keep the queue going after a failed job
++
++if [[ $# -lt 3 ]]; then
++  echo "Usage: $0 <gpu_ids> <master_port> <config.yaml> [config.yaml ...]"
++  exit 1
++fi
++
++GPUS="$1"
++PORT="$2"
++shift 2
++
++LOG_DIR="$PROJECT_ROOT/logs/phase0"
++mkdir -p "$LOG_DIR"
++
++for cfg in "$@"; do
++  log="$LOG_DIR/$(basename "$cfg" .yaml).log"
++  wait_gpus_free "$GPUS"
++  echo "[$(date '+%F %T')] START $cfg  GPU=$GPUS  port=$PORT" | tee -a "$log"
++  MASTER_PORT="$PORT" bash "$PROJECT_ROOT/scripts/train_4gpu.sh" "$cfg" "$GPUS" 2>&1 | tee -a "$log"
++  rc=${PIPESTATUS[0]}
++  echo "[$(date '+%F %T')] END   $cfg  exit=$rc" | tee -a "$log"
++done
+diff --git a/scripts/setup_env.sh b/scripts/setup_env.sh
+index 935d698..52a301d 100644
+--- a/scripts/setup_env.sh
++++ b/scripts/setup_env.sh
+@@ -1,30 +1,51 @@
+ #!/usr/bin/env bash
+-# One-time environment setup on the training server.
++# One-time environment setup on the training server: ./.venv with torch 2.10.0+cu128,
++# vendored timm and attnres_vit (editable). Activate later with: source .venv/bin/activate
++#
++# Why not conda / plain pip (147, 2026-10): conda.anaconda.org is unreachable and the defaults
++# channel needs ToS acceptance; the Aliyun mirrors throttle HTTP/1.1 (pip, uv) to ~0.24 MB/s but
++# serve HTTP/2 (curl) at ~25 MB/s. So torch, torchvision and torch's pinned nvidia/triton wheels
++# are fetched with curl, and uv installs from those files (only small packages come from the index).
++#
++# Usage:  bash scripts/setup_env.sh
++# Env:    PYTHON     CPython 3.13 to build the venv from (default ~/miniconda3/bin/python3)
++#         PIP_INDEX  PEP 503 simple index (default https://mirrors.aliyun.com/pypi/simple/)
++#         WHEELS     PyTorch wheel mirror (default https://mirrors.aliyun.com/pytorch-wheels/cu128)
+ set -euo pipefail
+ 
+ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ cd "$PROJECT_ROOT"
+ 
+-echo "==> Project root: $PROJECT_ROOT"
++PYTHON="${PYTHON:-$HOME/miniconda3/bin/python3}"
++export PIP_INDEX="${PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple/}"
++WHEELS="${WHEELS:-https://mirrors.aliyun.com/pytorch-wheels/cu128}"
++TORCH=torch-2.10.0+cu128-cp313-cp313-manylinux_2_28_x86_64.whl
++TORCHVISION=torchvision-0.25.0+cu128-cp313-cp313-manylinux_2_28_x86_64.whl
++UV=uv-0.9.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
++UV_URL="${PIP_INDEX%/simple/}/packages/4c/4a/d5357825bb47ff73762d247b1a553a966fef6802e3ab829fe60934cbf339/$UV"
+ 
+-# Recommend a dedicated conda env (adjust if you use venv).
+-if command -v conda &>/dev/null; then
+-  conda create -n attnres python=3.10 -y || true
+-  # shellcheck disable=SC1091
+-  source "$(conda info --base)/etc/profile.d/conda.sh"
+-  conda activate attnres
+-fi
++echo "==> venv ($("$PYTHON" --version)) in $PROJECT_ROOT/.venv"
++"$PYTHON" -m venv .venv
++# shellcheck disable=SC1091
++source .venv/bin/activate
+ 
+-echo "==> Installing PyTorch (adjust CUDA version if needed)..."
+-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
++echo "==> curl torch / torchvision / uv wheels into .wheels/"
++mkdir -p .wheels
++curl -fsSL --retry 3 -o ".wheels/$TORCH" "$WHEELS/$TORCH"
++curl -fsSL --retry 3 -o ".wheels/$TORCHVISION" "$WHEELS/$TORCHVISION"
++curl -fsSL --retry 3 -o ".wheels/$UV" "$UV_URL"
++pip install --no-index ".wheels/$UV"
+ 
+-echo "==> Installing vendored timm + attnres_vit..."
+-pip install -e "$PROJECT_ROOT/repos/timm"
+-pip install -e "$PROJECT_ROOT"
++echo "==> curl torch's pinned Linux dependency wheels"
++python scripts/lib/fetch_torch_deps.py ".wheels/$TORCH" .wheels
+ 
+-echo "==> Running smoke test (CPU/GPU forward pass)..."
+-python "$PROJECT_ROOT/tests/test_forward.py"
++echo "==> uv install: local wheels + small deps, vendored timm, attnres_vit"
++uv pip install --python .venv/bin/python -i "$PIP_INDEX" .wheels/*.whl -e repos/timm -e .
++python -c "import torch, timm; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.is_available(), '| timm', timm.__version__, timm.__file__)"
++
++echo "==> smoke test (forward pass of all models + AttnRes == baseline at init)"
++python tests/test_forward.py
+ 
+ echo ""
+-echo "Setup complete. Next: edit configs/phase0/*.yaml data_dir, then run:"
+-echo "  bash scripts/train_4gpu.sh configs/phase0/e01_d12_baseline.yaml 0,1,2,3"
++echo "Setup complete. Next: set data_dir in configs/phase0/*.yaml (RUN.md §3), then on each server:"
++echo "  source .venv/bin/activate && NODE=a bash scripts/run_phase0_node.sh   # NODE=b on the other server"
+diff --git a/scripts/validate.sh b/scripts/validate.sh
+index ae2e47b..ae52db8 100644
+--- a/scripts/validate.sh
++++ b/scripts/validate.sh
+@@ -1,5 +1,8 @@
+ #!/usr/bin/env bash
+-# Evaluate a trained checkpoint on ImageNet val set.
++# Evaluate a trained checkpoint on ImageNet val set (EMA weights).
++#
++# Training runs with model_ema, so timm logs EMA accuracy to summary.csv and picks
++# model_best.pth.tar by it; --use-ema evaluates the same weights.
+ #
+ # Usage:
+ #   bash scripts/validate.sh <config.yaml> <checkpoint.pth> [gpu_id]
+@@ -25,4 +28,5 @@ python "$PROJECT_ROOT/validate_imagenet.py" \
+   --model "$MODEL" \
+   --checkpoint "$CHECKPOINT" \
+   --batch-size 256 \
++  --use-ema \
+   --amp
+diff --git a/tests/test_forward.py b/tests/test_forward.py
+index 8fdae00..db80519 100644
+--- a/tests/test_forward.py
++++ b/tests/test_forward.py
+@@ -28,6 +28,21 @@ MODELS = [
+ ]
+ 
+ 
++def check_init_equivalence(device: str) -> None:
++    """Zero pseudo-queries => an AttnRes model equals the baseline with the same layer weights."""
++    x = torch.randn(2, 3, 224, 224, device=device)
++    for base_name in ["attnres_vit_tiny", "attnres_vit_d12_base"]:
++        attn = create_model(base_name + "_attnres").to(device).eval()
++        base = create_model(base_name).to(device).eval()
++        missing, unexpected = base.load_state_dict(attn.state_dict(), strict=False)
++        assert not missing and all(k.startswith("attn_res.") for k in unexpected)
++        with torch.inference_mode():
++            y_attn, y_base = attn.forward_features(x), base.forward_features(x)
++        rel = ((y_attn - y_base).norm() / y_base.norm()).item()
++        assert rel < 1e-3, f"{base_name}_attnres differs from {base_name} at init (rel {rel:.2e})"
++        print(f"OK  {base_name + '_attnres':35s}  == {base_name} at init (rel diff {rel:.1e})")
++
++
+ def main() -> None:
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+     x = torch.randn(2, 3, 224, 224, device=device)
+@@ -44,11 +59,13 @@ def main() -> None:
+         print(f"OK  {name:35s}  params={params:7.2f}M  out={tuple(y.shape)}")
+ 
+         if getattr(model, "use_attnres", False):
+-            weights = model.get_routing_weights(x)
+-            assert len(weights) > 0, f"{name}: expected routing weights"
+-            print(f"    routing blocks={len(weights)}, alpha shape={tuple(weights[0].shape)}")
++            with torch.inference_mode():
++                weights = model.get_routing_weights(x)
++            assert len(weights) == 2 * model.depth + 1, f"{name}: expected one weight map per AttnRes call"
++            print(f"    attnres calls={len(weights)}, last alpha shape={tuple(weights[-1].shape)}")
+ 
+     print("-" * 72)
++    check_init_equivalence(device)
+     print("All smoke tests passed.")
+ 
+ 
+diff --git a/tests/test_kimi_reference.py b/tests/test_kimi_reference.py
+new file mode 100644
+index 0000000..34d7554
+--- /dev/null
++++ b/tests/test_kimi_reference.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""AttnRes ViT vs a verbatim port of Kimi's Fig. 2 pseudo-code (arXiv:2603.15031).
++
++float64 with random (non-zero) pseudo-queries and RMSNorm gains, so it checks the wiring and the
++stack-free computation, not just the uniform-weight case at init. CPU, ~1 min.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "repos" / "timm"))
++
++import torch
++import attnres_vit  # noqa: F401
++from timm.models import create_model
++
++
++def block_attn_res(blocks, partial_block, proj, norm):
++    """Kimi Fig. 2, verbatim."""
++    V = torch.stack(blocks + [partial_block])  # [N+1, B, T, D]
++    K = norm(V)
++    logits = torch.einsum("d, n b t d -> n b t", proj.weight.squeeze(), K)
++    return torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), V)
++
++
++def kimi_reference(model, x):
++    """Kimi Fig. 2 forward: per-layer pre-attn / pre-MLP block_attn_res, 0-indexed layer_number."""
++    mods = [lambda srcs, m=m: block_attn_res(srcs[:-1], srcs[-1], m.proj, m.norm) for m in model.attn_res]
++    h = model.norm_pre(model._pos_embed(model.patch_embed(x)))
++    blocks, partial = [], h  # layer 0 appends the embedding as b_0
++    for l, blk in enumerate(model.blocks):
++        hh = mods[2 * l](blocks + [partial])
++        if l % model.block_size == 0:
++            blocks.append(partial)
++            partial = None
++        attn_out = blk.attn_branch(hh)
++        partial = attn_out if partial is None else partial + attn_out
++        hh = mods[2 * l + 1](blocks + [partial])
++        partial = partial + blk.mlp_branch(hh)
++    return model.norm(mods[2 * model.depth](blocks + [partial]))
++
++
++def main() -> None:
++    torch.manual_seed(0)
++    x = torch.randn(2, 3, 224, 224, dtype=torch.float64)
++    for name in ["attnres_vit_tiny_attnres", "attnres_vit_d12_base_attnres", "attnres_vit_d24_base_attnres"]:
++        m = create_model(name).double().eval()
++        assert all(float(mod.proj.weight.detach().abs().max()) == 0.0 for mod in m.attn_res), "queries not zero-initialized"
++        with torch.no_grad():
++            for mod in m.attn_res:  # random queries / gains: non-uniform depth weights
++                mod.proj.weight.normal_(std=0.2)
++                mod.norm.weight.uniform_(0.5, 1.5)
++            ours, ref = m.forward_features(x), kimi_reference(m, x)
++        rel = ((ours - ref).norm() / ref.norm()).item()
++        assert rel < 1e-10, f"{name}: differs from Kimi Fig. 2 (rel {rel:.2e})"
++        print(f"OK  {name:32s} == Kimi Fig. 2 port (float64 rel diff {rel:.1e})")
++    print("Kimi reference test passed.")
++
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,37 @@
+# E01: ViT depth=12, dim=768, standard residuals (baseline)
+model: attnres_vit_d12_base
+experiment: e01_d12_baseline
+seed: 42
+worker_seeding: all
+output: ./output/phase0
+
+data_dir: /data/imagenet
+train_split: train
+val_split: val
+img_size: 224
+batch_size: 128
+validation_batch_size: 256
+epochs: 300
+cooldown_epochs: 10
+opt: adamw
+lr: 0.001
+weight_decay: 0.05
+sched: cosine
+warmup_lr: 1.0e-6
+min_lr: 1.0e-5
+warmup_epochs: 5
+amp: true
+channels_last: true
+model_ema: true
+model_ema_decay: 0.9999
+mixup: 0.8
+cutmix: 1.0
+mixup_mode: batch
+aa: rand-m9-mstd0.5-inc1
+color_jitter: 0.4
+reprob: 0.25
+workers: 8
+pin_mem: true
+prefetcher: true
+log_interval: 50
+checkpoint_hist: 10

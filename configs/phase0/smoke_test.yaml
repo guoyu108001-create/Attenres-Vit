@@ -1,0 +1,22 @@
+# Quick smoke test (no real data needed for forward; use 1 epoch on tiny subset)
+model: attnres_vit_tiny_attnres
+experiment: smoke_test
+seed: 42
+worker_seeding: all
+output: ./output/phase0
+
+data_dir: /data/imagenet
+train_split: train
+val_split: val
+img_size: 224
+batch_size: 32
+validation_batch_size: 64
+epochs: 1
+opt: adamw
+lr: 0.001
+weight_decay: 0.05
+sched: cosine
+warmup_epochs: 0
+amp: true
+workers: 4
+log_interval: 10
